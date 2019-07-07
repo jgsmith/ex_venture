@@ -9,6 +9,7 @@ defmodule Game.Command.Move do
   alias Data.Exit
   alias Game.Command.AFK
   alias Game.Door
+  alias Game.DoorLock
   alias Game.Format.Proficiencies, as: FormatProficiencies
   alias Game.Player
   alias Game.Proficiency
@@ -35,7 +36,9 @@ defmodule Game.Command.Move do
       "in",
       "out",
       "open",
-      "close"
+      "close",
+      "lock",
+      "unlock"
     ],
     parse: false
   )
@@ -60,6 +63,13 @@ defmodule Game.Command.Move do
     Example:
     [ ] > {command}open west{/command}
     [ ] > {command}close west{/command}
+
+    If a door is locked, you can unlock it. Some locks require keys. You don't have to
+    be holding the key, but it does have to be either wielded or in your inventory.
+
+    Example:
+    [ ] > {command}unlock west{/command}
+    [ ] > {command}lock west{/command}
     """
   end
 
@@ -116,6 +126,27 @@ defmodule Game.Command.Move do
     end
   end
 
+  def parse("lock " <> direction) do
+    case parse(direction) do
+      {:move, direction} ->
+        {:lock, direction}
+
+      _ ->
+        {:error, :bad_parse, "lock #{direction}"}
+    end
+  end
+
+
+  def parse("unlock " <> direction) do
+    case parse(direction) do
+      {:move, direction} ->
+        {:unlock, direction}
+
+      _ ->
+        {:error, :bad_parse, "unlock #{direction}"}
+    end
+  end
+
   @impl Game.Command
   @doc """
   Move in the direction provided
@@ -141,8 +172,15 @@ defmodule Game.Command.Move do
     {:ok, room} = Environment.look(room_id)
 
     case room |> Exit.exit_to(direction) do
-      %{door_id: door_id, has_door: true} ->
-        state |> maybe_open_door(door_id) |> update_mini_map(room_id)
+      %{door_id: door_id, has_door: true} = door_info ->
+        with {:ok, state} <- maybe_unlock_door(state, door_info) do
+          state |> maybe_open_door(door_id) |> update_mini_map(room_id)
+        else
+          {:error, :door_locked} ->
+            state
+
+          error -> error
+        end
 
       %{id: _exit_id} ->
         message = "There is no door #{direction}."
@@ -175,6 +213,124 @@ defmodule Game.Command.Move do
     :ok
   end
 
+  def run({:lock, direction}, state = %{save: %{room_id: room_id}}) do
+    {:ok, room} = Environment.look(room_id)
+
+    case room |> Exit.exit_to(direction) do
+      %{door_id: door_id, has_door: true} = door_info ->
+        case Door.get(door_id) do
+          "open" ->
+            message = "The #{direction} door is open."
+            state |> Socket.echo(message)
+
+          "closed" ->
+            lock_closed_door(state, direction, door_info)
+        end
+
+      %{id: _exit_id} ->
+        message = "There is no door #{direction}."
+        state |> Socket.echo(message)
+
+      _ ->
+        message = "There is no exit #{direction}."
+        state |> Socket.echo(message)
+    end
+
+    :ok
+  end
+
+  def run({:unlock, direction}, state = %{save: %{room_id: room_id}}) do
+    {:ok, room} = Environment.look(room_id)
+
+    case room |> Exit.exit_to(direction) do
+      %{door_id: door_id, has_door: true} = door_info ->
+        case Door.get(door_id) do
+          "open" ->
+            message = "The #{direction} door is open."
+            state |> Socket.echo(message)
+
+          "closed" ->
+            unlock_closed_door(state, direction, door_info)
+        end
+
+      %{id: _exit_id} ->
+        message = "There is no door #{direction}."
+        state |> Socket.echo(message)
+
+      _ ->
+        message = "There is no exit #{direction}."
+        state |> Socket.echo(message)
+    end
+
+    :ok
+  end
+
+  @doc """
+  Lock a closed door. This assumes that the door is closed. Checks for key.
+  """
+  def lock_closed_door(state, direction, door_info) do
+    case door_info do
+      %{has_lock: true} ->
+        if DoorLock.locked?(door_info.door_id) do
+          message = "The #{direction} door is already locked."
+          state |> Socket.echo(message)
+        else
+          case door_info do
+            %{lock_key_id: key_id} when not is_nil(key_id) ->
+              if has_lock_key?(state, key_id) do
+                state |> lock_door(door_info.door_id)
+                message = "You locked the #{direction} door."
+                state |> Socket.echo(message)
+              else
+                message = "You don't have the right key to lock the #{direction} door."
+                state |> Socket.echo(message)
+              end
+
+            _ ->
+              message = "You don't have the right key to lock the #{direction} door."
+              state |> Socket.echo(message)
+          end
+        end
+
+      _ ->
+        message = "There is no lock on the #{direction} door."
+        state |> Socket.echo(message)
+    end
+  end
+
+  @doc """
+  Unlock a closed door. This assumes that the door is closed. Checks for key.
+  """
+  def unlock_closed_door(state, direction, door_info) do
+    case door_info do
+      %{has_lock: true} ->
+        if DoorLock.unlocked?(door_info.door_id) do
+          message = "The #{direction} door is already unlocked."
+          state |> Socket.echo(message)
+        else
+          case door_info do
+            %{lock_key_id: key_id} when not is_nil(key_id) ->
+              if has_lock_key?(state, key_id) do
+                state |> unlock_door(door_info.door_id)
+                message = "You unlocked the #{direction} door."
+                state |> Socket.echo(message)
+              else
+                message = "You don't have the right key to unlock the #{direction} door."
+                state |> Socket.echo(message)
+              end
+
+            _ ->
+              message = "You don't have the right key to unlock the #{direction} door."
+              state |> Socket.echo(message)
+          end
+        end
+
+      _ ->
+        message = "There is no lock on the #{direction} door."
+        state |> Socket.echo(message)
+    end
+  end
+
   @doc """
   Maybe move a player
 
@@ -183,7 +339,8 @@ defmodule Game.Command.Move do
   def maybe_move_to(state, room_id, room_exit, direction)
 
   def maybe_move_to(state, room_id, room_exit, direction) do
-    with {:ok, state} <- maybe_open_door_before_move(state, room_exit),
+    with {:ok, state} <- maybe_unlock_door_before_move(state, room_exit),
+         {:ok, state} <- maybe_open_door_before_move(state, room_exit),
          {:ok, state} <- check_cooldowns(state),
          {:ok, state} <- check_requirements(state, room_exit) do
       state |> move_to(room_id, {:leave, direction}, {:enter, Exit.opposite(direction)})
@@ -193,8 +350,37 @@ defmodule Game.Command.Move do
 
       {:error, :not_proficient, missing_requirements} ->
         state |> Socket.echo(FormatProficiencies.missing_requirements(direction, missing_requirements))
+
+      {:error, :door_locked} ->
+        state |> Socket.echo("You can't move through a locked door.")
     end
   end
+
+  defp maybe_unlock_door_before_move(state, room_exit = %{has_door: true, has_lock: true, lock_key_id: lock_key_id}) when not is_nil(lock_key_id) and lock_key_id != "" do
+    if Door.closed?(room_exit.door_id) && DoorLock.locked?(room_exit.door_id) do
+      if has_lock_key?(state, lock_key_id) do
+        state |> unlock_door(room_exit.door_id)
+        state |> Socket.echo("You unlocked the door.")
+        {:ok, state}
+      else
+        state |> Socket.echo("The door is locked.")
+        {:error, :door_locked}
+      end
+    else
+      {:ok, state}
+    end
+  end
+
+  defp maybe_unlock_door_before_move(state, room_exit = %{has_door: true, has_lock: true}) do
+    if Door.closed?(room_exit.door_id) && DoorLock.locked?(room_exit.door_id) do
+      state |> Socket.echo("The door is locked.")
+      {:error, :door_locked}
+    else
+      {:ok, state}
+    end
+  end
+
+  defp maybe_unlock_door_before_move(state, _), do: {:ok, state}
 
   defp maybe_open_door_before_move(state, room_exit = %{has_door: true}) do
     case Door.get(room_exit.door_id) do
@@ -271,6 +457,35 @@ defmodule Game.Command.Move do
   end
 
   @doc """
+  Unlock a door, if the door is locked
+  """
+  def maybe_unlock_door(state, _door_info = %{door_id: door_id, has_door: true, has_lock: true, lock_key_id: lock_key_id}) when not is_nil(lock_key_id) do
+    if Door.closed?(door_id) && DoorLock.locked?(door_id) do
+      if has_lock_key?(state, lock_key_id) do
+        DoorLock.set(door_id, "unlocked")
+        state |> Socket.echo("You unlocked the door.")
+        {:ok, state}
+      else
+        state |> Socket.echo("The door is locked.")
+        {:error, :door_locked}
+      end
+    else
+      {:ok, state}
+    end
+  end
+
+  def maybe_unlock_door(state, _door_info = %{door_id: door_id, has_door: true, has_lock: true}) do
+    if Door.closed?(door_id) && DoorLock.locked?(door_id) do
+      state |> Socket.echo("The door is locked.")
+      {:error, :door_locked}
+    else
+      {:ok, state}
+    end
+  end
+
+  def maybe_unlock_door(state, _), do: {:ok, state}
+
+  @doc """
   Open a door, if the door was closed
   """
   def maybe_open_door(state, door_id) do
@@ -299,6 +514,22 @@ defmodule Game.Command.Move do
         state |> Socket.echo("The door was already closed.")
     end
 
+    state
+  end
+
+  @doc """
+  Lock a door.
+  """
+  def lock_door(state, door_id) do
+    DoorLock.set(door_id, "locked")
+    state
+  end
+
+  @doc """
+  Unlock a door.
+  """
+  def unlock_door(state, door_id) do
+    DoorLock.set(door_id, "unlocked")
     state
   end
 
@@ -336,4 +567,19 @@ defmodule Game.Command.Move do
   end
 
   def clear_target(_state), do: :ok
+
+  def has_lock_key?(%{save: %{wielding: wielding, items: items}}, lock_key_id) do
+    Enum.any?(items, fn(item) -> item.id == lock_key_id end) ||
+    Enum.any?(wielding, fn({_slot, item}) -> item.id == lock_key_id end)
+  end
+
+  def has_lock_key?(%{save: %{items: items}}, lock_key_id) do
+    Enum.any?(items, fn(item) -> item.id == lock_key_id end)
+  end
+
+  def has_lock_key?(%{save: %{wielding: wielding}}, lock_key_id) do
+    Enum.any?(wielding, fn({_slot, item}) -> item.id == lock_key_id end)
+  end
+
+  def has_lock_key?(_, _), do: false
 end
